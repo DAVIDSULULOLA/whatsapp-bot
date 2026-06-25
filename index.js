@@ -4,6 +4,7 @@ const { exec } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const https = require("https");
+const readline = require("readline");
 
 const client = new Client({
   authStrategy: new LocalAuth(),
@@ -23,8 +24,12 @@ process.on("uncaughtException", (error) => {
 });
 
 // ─── CONFIG ───
-const YOUR_NUMBER = "2349016002865@c.us"; // change this
-const SUDO_NUMBERS = new Set(["2349016002865@c.us", "2348132329609@c.us"]); // add more numbers if needed
+// Owner number will be collected at runtime if not provided via env var
+let YOUR_NUMBER = process.env.YOUR_NUMBER || "";
+let SUDO_NUMBERS = new Set(
+  (process.env.SUDO_NUMBERS || "").split(",").filter(Boolean),
+);
+// Add any hardcoded fallbacks here if you want, otherwise keep SUDO empty
 const MAX_BROADCAST_RECIPIENTS = 20;
 const BROADCAST_RATE_LIMIT_MS = 10 * 60 * 1000; // one broadcast every 10 minutes
 const COMMAND_RATE_LIMIT_MS = 10 * 1000; // one command every 10 seconds per sudo
@@ -853,4 +858,52 @@ function checkScheduled() {
   });
 }
 
-client.initialize();
+// Prompt for owner number if missing, then initialize the client
+async function ensureOwnerNumber() {
+  if (YOUR_NUMBER) {
+    YOUR_NUMBER = String(YOUR_NUMBER).trim();
+    // sanitize
+    YOUR_NUMBER = YOUR_NUMBER.replace(/\D/g, "");
+    if (!YOUR_NUMBER.endsWith("@c.us")) YOUR_NUMBER = YOUR_NUMBER + "@c.us";
+    return;
+  }
+
+  if (!process.stdin.isTTY) {
+    console.error(
+      "No owner number provided and stdin is not interactive. Set YOUR_NUMBER env var.",
+    );
+    process.exit(1);
+  }
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  const answer = await new Promise((resolve) => {
+    rl.question(
+      "Enter your phone number with country code (e.g. 2349016002865): ",
+      (ans) => {
+        rl.close();
+        resolve(ans || "");
+      },
+    );
+  });
+
+  YOUR_NUMBER = String(answer).trim().replace(/\D/g, "");
+  if (!YOUR_NUMBER) {
+    console.error("No number entered — exiting.");
+    process.exit(1);
+  }
+  if (!YOUR_NUMBER.endsWith("@c.us")) YOUR_NUMBER = YOUR_NUMBER + "@c.us";
+}
+
+ensureOwnerNumber()
+  .then(() => {
+    // ensure owner is a sudo user
+    if (YOUR_NUMBER) SUDO_NUMBERS.add(YOUR_NUMBER);
+    client.initialize();
+  })
+  .catch((err) => {
+    console.error("Failed to set owner number:", err);
+    process.exit(1);
+  });
