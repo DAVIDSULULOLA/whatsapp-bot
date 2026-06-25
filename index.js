@@ -11,8 +11,13 @@ const client = new Client({
   puppeteer: {
     executablePath:
       "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    headless: false,
+    defaultViewport: null,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+    ],
   },
 });
 
@@ -173,7 +178,22 @@ function detectIntent(text) {
 // ─── QR & READY ───
 client.on("qr", (qr) => {
   qrcode.generate(qr, { small: true });
-  console.log("Scan QR lol");
+  console.log("Scan the QR code above with your WhatsApp mobile app.");
+});
+client.on("authenticated", () => {
+  console.log("Authenticated successfully. Session data saved.");
+});
+client.on("auth_failure", (message) => {
+  console.error("[AUTH FAILURE]", message);
+  console.error(
+    "Scan failed or session auth could not complete. Delete .wwebjs_auth and restart if needed.",
+  );
+});
+client.on("disconnected", (reason) => {
+  console.log("[DISCONNECTED]", reason);
+});
+client.on("loading_screen", (percent, message) => {
+  console.log(`Loading ${percent}%: ${message}`);
 });
 client.on("ready", async () => {
   console.log("Bot is live lol");
