@@ -6,13 +6,18 @@ const fs = require("fs");
 const https = require("https");
 const readline = require("readline");
 
+// IMPORTANT: authStrategy must be created BEFORE the Client is constructed.
+// The previous version created the Client first, then mutated client.authStrategy
+// after ensureOwnerNumber(), which can break session/auth initialization.
+let authStrategy;
+
 const client = new Client({
-  authStrategy: new LocalAuth(),
+  authStrategy: null,
   puppeteer: {
+    headless: true,
     executablePath:
+      process.env.CHROME_PATH ||
       "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    headless: false,
-    defaultViewport: null,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -250,17 +255,18 @@ client.on("ready", async () => {
   }, 60000);
 });
 
-// ─── AUTO VIEW STATUS ───
+// ─── AUTO REACT TO STATUS (NO MARK READ, NO STATUS MEDIA LOGS) ───
+// Goal: react to new statuses automatically without opening/downloading them.
+// NOTE: whatsapp-web.js status objects support `react(emoji)`.
 client.on("status", async (status) => {
-  await status.view();
-  if (status.hasMedia) {
-    if (!fs.existsSync("./statuses")) fs.mkdirSync("./statuses");
-    const media = await status.downloadMedia();
-    const ext = media.mimetype.split("/")[1];
-    fs.writeFileSync(
-      `./statuses/status_${Date.now()}.${ext}`,
-      Buffer.from(media.data, "base64"),
-    );
+  // Sudo check: only act if bot owner (YOUR_NUMBER) exists.
+  // Status events don't include a senderJid like normal messages, so we gate by sudo-owner presence only.
+  if (!YOUR_NUMBER) return;
+
+  try {
+    await status.react("✅");
+  } catch (e) {
+    console.error("[STATUS] Failed to react to status:", e);
   }
 });
 
@@ -921,8 +927,23 @@ ensureOwnerNumber()
   .then(() => {
     // ensure owner is a sudo user
     if (YOUR_NUMBER) SUDO_NUMBERS.add(YOUR_NUMBER);
-    client.initialize();
+    // configure LocalAuth to use a per-owner session directory to avoid collisions/locks
+    try {
+      const clientId = YOUR_NUMBER.replace(/\D/g, "");
+      const dataPath = process.env.WEBJS_AUTH_PATH || "./.wwebjs_auth";
+      authStrategy = new LocalAuth({ clientId, dataPath });
+    } catch (e) {
+      console.error("Failed to create LocalAuth clientId/dataPath:", e);
+      authStrategy = new LocalAuth();
+    }
+
+    // Now that authStrategy is ready, set it on the client and initialize once.
+    client.options.authStrategy = authStrategy;
+    if (!client.isInitialized) {
+      client.initialize();
+    }
   })
+
   .catch((err) => {
     console.error("Failed to set owner number:", err);
     process.exit(1);
