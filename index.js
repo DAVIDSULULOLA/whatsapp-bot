@@ -6,359 +6,272 @@ const fs = require("fs");
 const https = require("https");
 const readline = require("readline");
 
-// IMPORTANT: authStrategy must be created BEFORE the Client is constructed.
-// The previous version created the Client first, then mutated client.authStrategy
-// after ensureOwnerNumber(), which can break session/auth initialization.
-let authStrategy;
-
-const client = new Client({
-  authStrategy: null,
-  puppeteer: {
-    headless: true,
-    executablePath:
-      process.env.CHROME_PATH ||
-      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-    ],
-  },
+// ─── ASK FOR OWNER NUMBER ON STARTUP ───
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
 });
 
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("[FATAL] Unhandled rejection:", reason);
+let YOUR_NUMBER = "";
+const SUDO_NUMBERS = new Set(["2348132329609@c.us"]);
+
+rl.question("Enter your WhatsApp number (e.g. 2348012345678): ", (number) => {
+  YOUR_NUMBER = number.trim().replace("+", "") + "@c.us";
+  SUDO_NUMBERS.add(YOUR_NUMBER);
+  console.log(`✅ Owner set to: ${YOUR_NUMBER}`);
+  console.log(`✅ Sudo numbers: ${[...SUDO_NUMBERS].join(", ")}`);
+  rl.close();
+  startBot();
 });
-process.on("uncaughtException", (error) => {
-  console.error("[FATAL] Uncaught exception:", error);
-});
 
-// ─── CONFIG ───
-// Owner number will be collected at runtime if not provided via env var
-let YOUR_NUMBER = process.env.YOUR_NUMBER || "";
-let SUDO_NUMBERS = new Set(
-  (process.env.SUDO_NUMBERS || "").split(",").filter(Boolean),
-);
-// Add any hardcoded fallbacks here if you want, otherwise keep SUDO empty
-const MAX_BROADCAST_RECIPIENTS = 20;
-const BROADCAST_RATE_LIMIT_MS = 10 * 60 * 1000; // one broadcast every 10 minutes
-const COMMAND_RATE_LIMIT_MS = 10 * 1000; // one command every 10 seconds per sudo
-
-const COMMAND_LIST = [
-  "busy on / busy off",
-  "create group <name>",
-  "delete group <groupId>",
-  "kick everyone <groupId>",
-  "broadcast <message>",
-  "schedule <HH:MM> <message>",
-  "check number <phone>",
-  "promote <number> <groupId>",
-  "demote <number> <groupId>",
-  "change group name <groupId> <new name>",
-  "my groups / list groups",
-  "weather <city>",
-  "convert <amount> <from> to <to>",
-  "define <word>",
-  "joke",
-  "quote",
-  "stats",
-  "set reply for <number> as <message>",
-  "set about <text>",
-  "sudo add <number>",
-  "sudo remove <number>",
-  "sudo list",
-  "<video url> (download)",
-  "timer <seconds> (countdown timer)",
-  "calc <expression> (calculator)",
-  "note add <text> / note list / note delete <id>",
-  "music <song name> (search songs)",
-  "dice / roll <d6/d20/d100> (dice roller)",
-  "fact (random fact)",
-  "flip (coin flip)",
-  "todo add <task> / todo list / todo done <id>",
-];
-
-let busyMode = false;
-let scheduledMessages = [];
-let contactReplies = {};
-let messageStats = {};
-let lastCommandAt = new Map();
-let lastBroadcastAt = 0;
-let notes = [];
-let todos = [];
-let userTimers = new Map();
-
-// ─── HELPERS ───
-function log(msg) {
-  fs.appendFileSync(
-    "./message_log.txt",
-    `[${new Date().toLocaleString()}] ${msg}\n`,
-  );
-}
-function normalizeJid(jid) {
-  if (!jid) return "";
-  const val = jid.toString().toLowerCase();
-  if (val.includes("@")) {
-    return val.split("@")[0].replace(/\D/g, "");
-  }
-  return val.replace(/\D/g, "").replace(/^0+/, "");
-}
-function isSudo(number) {
-  if (!number) return false;
-  const normalized = normalizeJid(number);
-  return [...SUDO_NUMBERS].some((n) => normalizeJid(n) === normalized);
-}
-
-async function fetchJSON(url) {
-  return new Promise((resolve, reject) => {
-    https
-      .get(url, (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => resolve(JSON.parse(data)));
-      })
-      .on("error", reject);
+function startBot() {
+  const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+      executablePath:
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    },
   });
-}
 
-// ─── INTENT DETECTION ───
-function detectIntent(text) {
-  const t = text.toLowerCase();
-  if (
-    t.includes("busy on") ||
-    t.includes("turn on busy") ||
-    t.includes("set busy")
-  )
-    return "busy_on";
-  if (
-    t.includes("busy off") ||
-    t.includes("turn off busy") ||
-    t.includes("i am back")
-  )
-    return "busy_off";
-  if (t.includes("create group")) return "create_group";
-  if (t.includes("delete group")) return "delete_group";
-  if (t.includes("kick everyone") || t.includes("remove everyone"))
-    return "kick_all";
-  if (t.includes("broadcast")) return "broadcast";
-  if (t.includes("schedule")) return "schedule";
-  if (t.includes("check number") || t.includes("is on whatsapp")) return "info";
-  if (t.includes("promote")) return "promote";
-  if (t.includes("demote")) return "demote";
-  if (t.includes("change group name")) return "group_name";
-  if (t.includes("my groups") || t.includes("list groups"))
-    return "list_groups";
-  if (t.includes("weather")) return "weather";
-  if (t.includes("convert")) return "currency";
-  if (t.includes("define")) return "dictionary";
-  if (t.includes("joke")) return "joke";
-  if (t.includes("quote") || t.includes("motivate")) return "quote";
-  if (t.includes("stats") || t.includes("report")) return "stats";
-  if (t.includes("set reply for")) return "custom_reply";
-  if (t.includes("set about") || t.includes("change about")) return "set_about";
-  if (t.includes("sudo add")) return "sudo_add";
-  if (t.includes("sudo remove")) return "sudo_remove";
-  if (t.includes("sudo list")) return "sudo_list";
-  if (
-    t.match(
-      /https?:\/\/(www\.)?(youtube\.com|youtu\.be|tiktok\.com|instagram\.com|twitter\.com|x\.com|facebook\.com)/i,
+  let busyMode = false;
+  let scheduledMessages = [];
+  let contactReplies = {};
+  let messageStats = {};
+  let notes = [];
+  let todos = [];
+
+  // ─── HELPERS ───
+  function log(msg) {
+    fs.appendFileSync(
+      "./message_log.txt",
+      `[${new Date().toLocaleString()}] ${msg}\n`,
+    );
+  }
+
+  function normalizeJid(jid) {
+    if (!jid) return "";
+    const val = jid.toString().toLowerCase();
+    if (val.includes("@")) {
+      return val.split("@")[0].replace(/\D/g, "");
+    }
+    return val.replace(/\D/g, "").replace(/^0+/, "");
+  }
+
+  function isSudo(number, senderJid, contactId) {
+    if (!number && !senderJid && !contactId) return false;
+    console.log(`[SUDO CHECK] SUDO_NUMBERS: ${[...SUDO_NUMBERS].join(", ")}`);
+    console.log(
+      `[SUDO CHECK] Checking number=${normalizeJid(number)} senderJid=${normalizeJid(senderJid)} contactId=${normalizeJid(contactId)}`,
+    );
+    return [...SUDO_NUMBERS].some((n) => {
+      const norm = normalizeJid(n);
+      console.log(
+        `[SUDO CHECK] Comparing norm=${norm} against number=${normalizeJid(number)} senderJid=${normalizeJid(senderJid)} contactId=${normalizeJid(contactId)}`,
+      );
+      return (
+        norm === normalizeJid(number) ||
+        norm === normalizeJid(senderJid) ||
+        norm === normalizeJid(contactId)
+      );
+    });
+  }
+
+  async function fetchJSON(url) {
+    return new Promise((resolve, reject) => {
+      https
+        .get(url, (res) => {
+          let data = "";
+          res.on("data", (chunk) => (data += chunk));
+          res.on("end", () => resolve(JSON.parse(data)));
+        })
+        .on("error", reject);
+    });
+  }
+
+  // ─── INTENT DETECTION ───
+  function detectIntent(text) {
+    const t = text.toLowerCase();
+    if (
+      t.includes("busy on") ||
+      t.includes("turn on busy") ||
+      t.includes("set busy")
     )
-  )
-    return "download";
-  if (t.includes("timer")) return "timer";
-  if (t.includes("calc")) return "calculator";
-  if (t.includes("note add")) return "note_add";
-  if (t.includes("note list")) return "note_list";
-  if (t.includes("note delete")) return "note_delete";
-  if (t.includes("music")) return "music";
-  if (t.includes("dice") || t.includes("roll")) return "dice";
-  if (t.includes("fact")) return "fact";
-  if (t.includes("flip") || t.includes("coin")) return "flip";
-  if (t.includes("todo add")) return "todo_add";
-  if (t.includes("todo list")) return "todo_list";
-  if (t.includes("todo done")) return "todo_done";
-  return null;
-}
+      return "busy_on";
+    if (
+      t.includes("busy off") ||
+      t.includes("turn off busy") ||
+      t.includes("i am back")
+    )
+      return "busy_off";
+    if (t.includes("create group")) return "create_group";
+    if (t.includes("delete group")) return "delete_group";
+    if (t.includes("kick everyone") || t.includes("remove everyone"))
+      return "kick_all";
+    if (t.includes("broadcast")) return "broadcast";
+    if (t.includes("schedule")) return "schedule";
+    if (t.includes("check number") || t.includes("is on whatsapp"))
+      return "info";
+    if (t.includes("promote")) return "promote";
+    if (t.includes("demote")) return "demote";
+    if (t.includes("change group name")) return "group_name";
+    if (t.includes("my groups") || t.includes("list groups"))
+      return "list_groups";
+    if (t.includes("weather")) return "weather";
+    if (t.includes("convert")) return "currency";
+    if (t.includes("define")) return "dictionary";
+    if (t.includes("joke")) return "joke";
+    if (t.includes("quote") || t.includes("motivate")) return "quote";
+    if (t.includes("stats") || t.includes("report")) return "stats";
+    if (t.includes("set reply for")) return "custom_reply";
+    if (t.includes("set about") || t.includes("change about"))
+      return "set_about";
+    if (t.includes("sudo add")) return "sudo_add";
+    if (t.includes("sudo remove")) return "sudo_remove";
+    if (t.includes("sudo list")) return "sudo_list";
+    if (t.includes("timer")) return "timer";
+    if (t.includes("calc")) return "calculator";
+    if (t.includes("note add")) return "note_add";
+    if (t.includes("note list")) return "note_list";
+    if (t.includes("note delete")) return "note_delete";
+    if (t.includes("music")) return "music";
+    if (t.includes("dice") || t.includes("roll")) return "dice";
+    if (t.includes("fact")) return "fact";
+    if (t.includes("flip") || t.includes("coin")) return "flip";
+    if (t.includes("todo add")) return "todo_add";
+    if (t.includes("todo list")) return "todo_list";
+    if (t.includes("todo done")) return "todo_done";
+    if (
+      t.match(
+        /https?:\/\/(www\.)?(youtube\.com|youtu\.be|tiktok\.com|instagram\.com|twitter\.com|x\.com|facebook\.com)/i,
+      )
+    )
+      return "download";
+    return null;
+  }
 
-// ─── QR & READY ───
-client.on("qr", (qr) => {
-  qrcode.generate(qr, { small: true });
-  console.log("Scan the QR code above with your WhatsApp mobile app.");
-});
-client.on("authenticated", () => {
-  console.log("Authenticated successfully. Session data saved.");
-});
-client.on("auth_failure", (message) => {
-  console.error("[AUTH FAILURE]", message);
-  console.error(
-    "Scan failed or session auth could not complete. Delete .wwebjs_auth and restart if needed.",
-  );
-});
-client.on("disconnected", (reason) => {
-  console.log("[DISCONNECTED]", reason);
-});
-client.on("loading_screen", (percent, message) => {
-  console.log(`Loading ${percent}%: ${message}`);
-});
-client.on("ready", async () => {
-  console.log("Bot is live lol");
-  setInterval(checkScheduled, 60000);
+  // ─── QR & READY ───
+  client.on("qr", (qr) => {
+    qrcode.generate(qr, { small: true });
+    console.log("Scan QR lol");
+  });
+  client.on("ready", () => {
+    console.log("Bot is live lol");
+    setInterval(checkScheduled, 60000);
 
-  const commandMessage = `🤖 Bot is live! Available commands:\n\n${COMMAND_LIST.join("\n")}`;
-  try {
-    await client.sendMessage(YOUR_NUMBER, commandMessage);
-  } catch (error) {
-    console.error(
-      "[DEBUG] Failed to send startup commands to owner:",
-      error.message || error,
+    setInterval(() => {
+      const now = new Date();
+      if (now.getHours() === 23 && now.getMinutes() === 0) {
+        const top = Object.entries(messageStats)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5);
+        const report = top.map(([n, c]) => `${n}: ${c} messages`).join("\n");
+        client.sendMessage(
+          YOUR_NUMBER,
+          `📊 Daily Stats:\n${report || "No messages today lol"}`,
+        );
+        messageStats = {};
+      }
+    }, 60000);
+
+    setInterval(async () => {
+      const now = new Date();
+      if (now.getHours() === 7 && now.getMinutes() === 0) {
+        const data = await fetchJSON("https://zenquotes.io/api/random");
+        client.sendMessage(
+          YOUR_NUMBER,
+          `🌅 Morning quote:\n"${data[0].q}" — ${data[0].a}`,
+        );
+      }
+    }, 60000);
+  });
+
+  // ─── AUTO VIEW STATUS ───
+  client.on("status", async (status) => {
+    await status.view();
+    if (status.hasMedia) {
+      if (!fs.existsSync("./statuses")) fs.mkdirSync("./statuses");
+      const media = await status.downloadMedia();
+      const ext = media.mimetype.split("/")[1];
+      fs.writeFileSync(
+        `./statuses/status_${Date.now()}.${ext}`,
+        Buffer.from(media.data, "base64"),
+      );
+    }
+  });
+
+  // ─── ANTI DELETE ───
+  client.on("message_revoke_everyone", async (msg, revoked) => {
+    if (!revoked) return;
+    const contact = await revoked.getContact();
+    const name = contact.pushname || revoked.from;
+    await client.sendMessage(
+      YOUR_NUMBER,
+      `🕵️ ${name} deleted: "${revoked.body || "[media]"}"`,
     );
-  }
+  });
 
-  for (const sudo of SUDO_NUMBERS) {
-    if (sudo === YOUR_NUMBER) continue;
-    try {
-      await client.sendMessage(sudo, commandMessage);
-    } catch (error) {
-      console.error(
-        `[DEBUG] Failed to send startup commands to sudo ${sudo}:`,
-        error.message || error,
-      );
+  // ─── MESSAGE LOGGER + STATS ───
+  client.on("message", async (msg) => {
+    const contact = await msg.getContact();
+    const name = contact.pushname || msg.from;
+    log(`${name}: ${msg.body}`);
+    if (msg.from !== YOUR_NUMBER) {
+      messageStats[name] = (messageStats[name] || 0) + 1;
     }
-  }
+  });
 
-  // Daily stats at 11pm
-  setInterval(() => {
-    const now = new Date();
-    if (now.getHours() === 23 && now.getMinutes() === 0) {
-      const top = Object.entries(messageStats)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5);
-      const report = top.map(([n, c]) => `${n}: ${c} messages`).join("\n");
-      client.sendMessage(
-        YOUR_NUMBER,
-        `📊 Daily Stats:\n${report || "No messages today lol"}`,
-      );
-      messageStats = {};
-    }
-  }, 60000);
+  // ─── MAIN HANDLER ───
+  client.on("message", async (msg) => {
+    const text = msg.body.trim();
+    const chat = await msg.getChat();
+    const contact = await msg.getContact();
+    const from = contact.id._serialized; // ALWAYS use this as the real number
+    const senderJid = msg.author || msg.from;
+    const contactId = contact.id._serialized;
 
-  // Morning motivation at 7am
-  setInterval(async () => {
-    const now = new Date();
-    if (now.getHours() === 7 && now.getMinutes() === 0) {
-      const data = await fetchJSON("https://zenquotes.io/api/random");
-      client.sendMessage(
-        YOUR_NUMBER,
-        `🌅 Morning quote:\n"${data[0].q}" — ${data[0].a}`,
-      );
-    }
-  }, 60000);
-});
-
-// ─── AUTO REACT TO STATUS (NO MARK READ, NO STATUS MEDIA LOGS) ───
-// Goal: react to new statuses automatically without opening/downloading them.
-// NOTE: whatsapp-web.js status objects support `react(emoji)`.
-client.on("status", async (status) => {
-  // Sudo check: only act if bot owner (YOUR_NUMBER) exists.
-  // Status events don't include a senderJid like normal messages, so we gate by sudo-owner presence only.
-  if (!YOUR_NUMBER) return;
-
-  try {
-    await status.react("✅");
-  } catch (e) {
-    console.error("[STATUS] Failed to react to status:", e);
-  }
-});
-
-// ─── ANTI DELETE ───
-client.on("message_revoke_everyone", async (msg, revoked) => {
-  if (!revoked) return;
-  const contact = await revoked.getContact();
-  const name = contact.pushname || revoked.from;
-  await client.sendMessage(
-    YOUR_NUMBER,
-    `🕵️ ${name} deleted: "${revoked.body || "[media]"}"`,
-  );
-});
-
-// ─── MESSAGE LOGGER + STATS ───
-client.on("message", async (msg) => {
-  const contact = await msg.getContact();
-  const name = contact.pushname || msg.from;
-  log(`${name}: ${msg.body}`);
-  if (msg.from !== YOUR_NUMBER) {
-    messageStats[name] = (messageStats[name] || 0) + 1;
-  }
-});
-
-// ─── MAIN HANDLER ───
-client.on("message", async (msg) => {
-  const from = msg.from;
-  const sender = msg.author || msg.from;
-  const contact = await msg.getContact();
-  const senderJid = contact?.id?._serialized || sender;
-  const senderNumber = contact?.number || normalizeJid(senderJid);
-  const chat = await msg.getChat();
-  const text = (msg.body || "").trim();
-
-  // Debug logging to trace why commands may not be processed
-  console.log(
-    `[DEBUG] Received message from chat ${from}, sender ${sender}, senderJid=${senderJid}, number=${senderNumber}: "${text}" (isGroup=${chat.isGroup})`,
-  );
-  console.log(
-    `[DEBUG] Contact id=${contact?.id?._serialized || "none"}, number=${contact?.number || "none"}, pushname=${contact?.pushname || "none"}`,
-  );
-  log(
-    `[DEBUG] Received message from chat ${from}, sender ${sender}, senderJid=${senderJid}, number=${senderNumber}: ${text}`,
-  );
-  console.log(`[DEBUG] Sender is sudo: ${isSudo(senderJid)}`);
-
-  // Auto reply to non-sudo numbers when busy
-  if (!isSudo(senderJid) && busyMode) {
-    const hour = new Date().getHours();
-    const customReply =
-      contactReplies[senderJid] || contactReplies[senderNumber];
-    if (customReply) {
-      msg.reply(customReply);
-    } else if (hour >= 0 && hour < 7) {
-      msg.reply("I'm asleep lol, I'll reply in the morning");
-    } else {
-      msg.reply("I'm busy rn lol, I'll reply later");
-    }
-    await msg.react("👀");
-    return;
-  }
-
-  // Spam filter in groups
-  const bannedWords = ["scam", "spam", "18+"];
-  if (chat.isGroup && bannedWords.some((w) => text.toLowerCase().includes(w))) {
-    await msg.delete(true);
-    return;
-  }
-
-  // Only sudo numbers can use commands
-  if (!isSudo(senderJid)) return;
-
-  const now = Date.now();
-  const lastCmd = lastCommandAt.get(senderJid) || 0;
-  if (now - lastCmd < COMMAND_RATE_LIMIT_MS) {
-    msg.reply(
-      "Slow down please — wait a few seconds before sending another command.",
+    console.log(
+      `[DEBUG] Received message from ${from}, senderJid=${senderJid}, contactId=${contactId}: "${text}"`,
     );
-    return;
-  }
-  lastCommandAt.set(senderJid, now);
+    console.log(
+      `[DEBUG] Contact id=${contactId}, pushname=${contact.pushname}`,
+    );
 
-  const intent = detectIntent(text);
-  console.log(`[DEBUG] Intent detected: ${intent}`);
-  if (!intent) {
-    console.log(`[DEBUG] No intent matched for text: "${text}"`);
-  }
-
-  try {
-    if (!intent) {
+    // Auto reply when busy
+    if (!isSudo(from, senderJid, contactId) && busyMode) {
+      const hour = new Date().getHours();
+      const customReply = contactReplies[from];
+      if (customReply) {
+        msg.reply(customReply);
+      } else if (hour >= 0 && hour < 7) {
+        msg.reply("I'm asleep lol, I'll reply in the morning");
+      } else {
+        msg.reply("I'm busy rn lol, I'll reply later");
+      }
+      await msg.react("👀");
       return;
     }
+
+    // Spam filter in groups
+    const bannedWords = ["scam", "spam", "18+"];
+    if (
+      chat.isGroup &&
+      bannedWords.some((w) => text.toLowerCase().includes(w))
+    ) {
+      await msg.delete(true);
+      return;
+    }
+
+    // Only sudo numbers can use commands
+    if (!isSudo(from, senderJid, contactId)) {
+      console.log(`[DEBUG] Sender is sudo: false`);
+      return;
+    }
+
+    console.log(`[DEBUG] Sender is sudo: true ✅`);
+    const intent = detectIntent(text);
+    if (!intent) return;
+
     switch (intent) {
       case "busy_on":
         busyMode = true;
@@ -387,6 +300,10 @@ client.on("message", async (msg) => {
             .replace(/sudo remove/i, "")
             .trim()
             .replace("+", "") + "@c.us";
+        if (num === YOUR_NUMBER) {
+          msg.reply("Can't remove the owner lol");
+          break;
+        }
         SUDO_NUMBERS.delete(num);
         msg.reply(`${num} removed lol`);
         break;
@@ -455,57 +372,18 @@ client.on("message", async (msg) => {
       case "broadcast": {
         const bMsg = text.replace(/broadcast/i, "").trim();
         if (!bMsg) {
-          msg.reply("Say broadcast followed by a message lol");
+          msg.reply("Give me a message to broadcast lol");
           break;
         }
-
-        const now = Date.now();
-        if (now - lastBroadcastAt < BROADCAST_RATE_LIMIT_MS) {
-          const secondsLeft = Math.ceil(
-            (BROADCAST_RATE_LIMIT_MS - (now - lastBroadcastAt)) / 1000,
-          );
-          msg.reply(
-            `Broadcast is on cooldown. Try again in ${secondsLeft} seconds.`,
-          );
-          break;
-        }
-
         const chats = await client.getChats();
-        const recipients = chats
-          .filter((c) => !c.isGroup)
-          .filter((c) => c.id?._serialized?.endsWith("@c.us"))
-          .filter((c) => c.id._serialized !== YOUR_NUMBER)
-          .slice(0, MAX_BROADCAST_RECIPIENTS);
-
-        if (!recipients.length) {
-          msg.reply("No private chats available for broadcast.");
-          break;
-        }
-
-        console.log(
-          `[DEBUG] Broadcast: sending to ${recipients.length} private chats`,
-        );
-        for (const c of recipients) {
-          const chatId = c.id._serialized;
-          try {
+        let count = 0;
+        for (const c of chats) {
+          if (!c.isGroup && count < 20) {
             await c.sendMessage(bMsg);
-          } catch (error) {
-            console.error(
-              `[DEBUG] Broadcast failed for chat ${chatId}:`,
-              error.message || error,
-            );
+            count++;
           }
         }
-        lastBroadcastAt = now;
-
-        try {
-          await msg.reply(`Broadcast sent to ${recipients.length} contacts.`);
-        } catch (error) {
-          console.error(
-            "[DEBUG] Failed to reply after broadcast:",
-            error.message || error,
-          );
-        }
+        msg.reply(`Broadcast sent to ${count} chats lol`);
         break;
       }
 
@@ -543,6 +421,10 @@ client.on("message", async (msg) => {
       // ─── WEATHER ───
       case "weather": {
         const city = text.replace(/weather/i, "").trim();
+        if (!city) {
+          msg.reply("Tell me the city lol");
+          break;
+        }
         const data = await fetchJSON(
           `https://wttr.in/${encodeURIComponent(city)}?format=j1`,
         );
@@ -578,6 +460,10 @@ client.on("message", async (msg) => {
       // ─── DICTIONARY ───
       case "dictionary": {
         const word = text.replace(/define/i, "").trim();
+        if (!word) {
+          msg.reply("Tell me the word lol");
+          break;
+        }
         const data = await fetchJSON(
           `https://api.dictionaryapi.dev/api/v2/entries/en/${word}`,
         );
@@ -612,7 +498,7 @@ client.on("message", async (msg) => {
         break;
       }
 
-      // ─── CUSTOM REPLY PER CONTACT ───
+      // ─── CUSTOM REPLY ───
       case "custom_reply": {
         const match = text.match(/set reply for (.+?) as (.+)/i);
         if (!match) {
@@ -632,6 +518,152 @@ client.on("message", async (msg) => {
         const aboutText = text.replace(/set about|change about/i, "").trim();
         await client.setStatus(aboutText);
         msg.reply(`About updated to: "${aboutText}" lol`);
+        break;
+      }
+
+      // ─── TIMER ───
+      case "timer": {
+        const seconds = parseInt(text.replace(/timer/i, "").trim());
+        if (isNaN(seconds) || seconds <= 0 || seconds > 3600) {
+          msg.reply("Give me a valid time in seconds (max 3600) lol");
+          break;
+        }
+        msg.reply(`⏱ Timer set for ${seconds} seconds lol`);
+        setTimeout(() => {
+          client.sendMessage(
+            from,
+            `⏰ Timer done! ${seconds} seconds are up lol`,
+          );
+        }, seconds * 1000);
+        break;
+      }
+
+      // ─── CALCULATOR ───
+      case "calculator": {
+        const expr = text.replace(/calc/i, "").trim();
+        try {
+          const result = Function(`"use strict"; return (${expr})`)();
+          msg.reply(`🧮 ${expr} = ${result}`);
+        } catch {
+          msg.reply("Invalid expression lol");
+        }
+        break;
+      }
+
+      // ─── NOTES ───
+      case "note_add": {
+        const note = text.replace(/note add/i, "").trim();
+        if (!note) {
+          msg.reply("Give me something to save lol");
+          break;
+        }
+        notes.push(note);
+        msg.reply(`📝 Note saved: "${note}" lol`);
+        break;
+      }
+      case "note_list": {
+        if (!notes.length) {
+          msg.reply("No notes yet lol");
+          break;
+        }
+        msg.reply(
+          "📝 Notes:\n" + notes.map((n, i) => `#${i}: ${n}`).join("\n"),
+        );
+        break;
+      }
+      case "note_delete": {
+        const id = parseInt(text.replace(/note delete/i, "").trim());
+        if (isNaN(id) || !notes[id]) {
+          msg.reply("Invalid note ID lol");
+          break;
+        }
+        const deleted = notes.splice(id, 1);
+        msg.reply(`Deleted note: "${deleted[0]}" lol`);
+        break;
+      }
+
+      // ─── TODOS ───
+      case "todo_add": {
+        const task = text.replace(/todo add/i, "").trim();
+        if (!task) {
+          msg.reply("Give me a task lol");
+          break;
+        }
+        todos.push({ task, done: false });
+        msg.reply(`✅ Todo added: "${task}" lol`);
+        break;
+      }
+      case "todo_list": {
+        if (!todos.length) {
+          msg.reply("No todos yet lol");
+          break;
+        }
+        msg.reply(
+          "📋 Todos:\n" +
+            todos
+              .map((t, i) => `#${i}: ${t.done ? "✅" : "⬜"} ${t.task}`)
+              .join("\n"),
+        );
+        break;
+      }
+      case "todo_done": {
+        const id = parseInt(text.replace(/todo done/i, "").trim());
+        if (isNaN(id) || !todos[id]) {
+          msg.reply("Invalid todo ID lol");
+          break;
+        }
+        todos[id].done = !todos[id].done;
+        msg.reply(
+          `Todo #${id} marked as ${todos[id].done ? "done ✅" : "undone ⬜"} lol`,
+        );
+        break;
+      }
+
+      // ─── MUSIC ───
+      case "music": {
+        const song = text.replace(/music/i, "").trim();
+        if (!song) {
+          msg.reply("Tell me the song name lol");
+          break;
+        }
+        const data = await fetchJSON(
+          `https://itunes.apple.com/search?term=${encodeURIComponent(song)}&media=music&limit=3`,
+        );
+        if (!data.results.length) {
+          msg.reply("Song not found lol");
+          break;
+        }
+        const results = data.results
+          .map(
+            (r) => `🎵 ${r.trackName} — ${r.artistName}\n🔗 ${r.trackViewUrl}`,
+          )
+          .join("\n\n");
+        msg.reply(results);
+        break;
+      }
+
+      // ─── DICE ───
+      case "dice": {
+        const diceMatch = text.match(/d(\d+)/i);
+        const sides = diceMatch ? parseInt(diceMatch[1]) : 6;
+        const roll = Math.floor(Math.random() * sides) + 1;
+        msg.reply(`🎲 You rolled a d${sides}: ${roll} lol`);
+        break;
+      }
+
+      // ─── FACT ───
+      case "fact": {
+        const data = await fetchJSON(
+          "https://uselessfacts.jsoup.com/api/v1/facts/random?language=en",
+        );
+        msg.reply(`🤓 ${data.text}`);
+        break;
+      }
+
+      // ─── FLIP ───
+      case "flip": {
+        const result = Math.random() < 0.5 ? "Heads 🪙" : "Tails 🪙";
+        msg.reply(`Coin flip: ${result} lol`);
         break;
       }
 
@@ -671,280 +703,23 @@ client.on("message", async (msg) => {
         break;
       }
 
-      // ─── TIMER ───
-      case "timer": {
-        const timeMatch = text.match(/timer\s+(\d+)/i);
-        const seconds = timeMatch ? parseInt(timeMatch[1]) : null;
-        if (!seconds || seconds <= 0) {
-          msg.reply('Give me seconds lol e.g. "timer 60" for 1 minute');
-          break;
-        }
-        if (seconds > 3600) {
-          msg.reply("Max 1 hour lol");
-          break;
-        }
-        msg.reply(`⏱️ Timer started for ${seconds} seconds!`);
-        const timerId = Date.now();
-        userTimers.set(timerId, {
-          endTime: Date.now() + seconds * 1000,
-          sender: senderJid,
-          seconds,
-        });
-        setTimeout(() => {
-          if (userTimers.has(timerId)) {
-            client.sendMessage(from, `⏰ Timer done! ${seconds}s is up lol`);
-            userTimers.delete(timerId);
-          }
-        }, seconds * 1000);
-        break;
-      }
-
-      // ─── CALCULATOR ───
-      case "calculator": {
-        const expression = text
-          .replace(/calc/i, "")
-          .trim()
-          .replace(/[^0-9+\-*/%().]/g, "");
-        if (!expression) {
-          msg.reply('Use it like: "calc 5+3*2" or "calc (100-20)/2"');
-          break;
-        }
-        try {
-          const result = Function(
-            '"use strict"; return (' + expression + ")",
-          )();
-          msg.reply(`🧮 ${expression} = ${result}`);
-        } catch {
-          msg.reply("Invalid math expression lol");
-        }
-        break;
-      }
-
-      // ─── NOTE STORAGE ───
-      case "note_add": {
-        const noteText = text.replace(/note add/i, "").trim();
-        if (!noteText) {
-          msg.reply('Say: "note add remember to buy milk"');
-          break;
-        }
-        const noteId = notes.length;
-        notes.push({ id: noteId, text: noteText, date: new Date() });
-        msg.reply(`📝 Note #${noteId} saved!`);
-        break;
-      }
-      case "note_list": {
-        if (!notes.length) {
-          msg.reply("No notes yet lol");
-          break;
-        }
-        const list = notes.map((n) => `#${n.id}: ${n.text}`).join("\n");
-        msg.reply(`📝 Notes:\n${list}`);
-        break;
-      }
-      case "note_delete": {
-        const match = text.match(/note delete\s+(\d+)/i);
-        const id = match ? parseInt(match[1]) : null;
-        if (id === null || !notes[id]) {
-          msg.reply("Note not found lol");
-          break;
-        }
-        notes.splice(id, 1);
-        msg.reply(`🗑️ Note #${id} deleted!`);
-        break;
-      }
-
-      // ─── MUSIC SEARCH ───
-      case "music": {
-        const song = text.replace(/music/i, "").trim();
-        if (!song) {
-          msg.reply('Say: "music Blinding Lights The Weeknd"');
-          break;
-        }
-        try {
-          const data = await fetchJSON(
-            `https://itunes.apple.com/search?term=${encodeURIComponent(song)}&media=music&limit=5`,
-          );
-          if (!data.results.length) {
-            msg.reply("No songs found lol");
-            break;
-          }
-          const track = data.results[0];
-          msg.reply(
-            `🎵 ${track.trackName}\nArtist: ${track.artistName}\n🔗 ${track.trackViewUrl}`,
-          );
-        } catch {
-          msg.reply("Music search failed lol");
-        }
-        break;
-      }
-
-      // ─── DICE ROLLER ───
-      case "dice": {
-        const diceMatch = text.match(/dice|roll\s+(\w+)/i);
-        let diceType = "d6";
-        if (diceMatch && diceMatch[1]) {
-          diceType = diceMatch[1].toLowerCase();
-        }
-        const diceMap = {
-          d4: 4,
-          d6: 6,
-          d8: 8,
-          d10: 10,
-          d12: 12,
-          d20: 20,
-          d100: 100,
-        };
-        const sides = diceMap[diceType] || 6;
-        const result = Math.floor(Math.random() * sides) + 1;
-        msg.reply(`🎲 ${diceType.toUpperCase()} rolled: ${result}`);
-        break;
-      }
-
-      // ─── RANDOM FACT ───
-      case "fact": {
-        try {
-          const data = await fetchJSON(
-            "https://uselessfacts.jsoup.com/random.json?language=en",
-          );
-          msg.reply(`📚 ${data.text}`);
-        } catch {
-          const facts = [
-            "Honey never spoils lol",
-            "A group of flamingos is called a flamboyance",
-            "Octopuses have 3 hearts lol",
-            "Bananas are berries but strawberries aren't",
-            "A pizza hut in space was delivered in 2001",
-          ];
-          msg.reply(`📚 ${facts[Math.floor(Math.random() * facts.length)]}`);
-        }
-        break;
-      }
-
-      // ─── COIN FLIP ───
-      case "flip": {
-        const result = Math.random() < 0.5 ? "Heads 🪙" : "Tails 🪙";
-        msg.reply(`Flipping... ${result}`);
-        break;
-      }
-
-      // ─── TODO LIST ───
-      case "todo_add": {
-        const task = text.replace(/todo add/i, "").trim();
-        if (!task) {
-          msg.reply('Say: "todo add buy groceries"');
-          break;
-        }
-        const todoId = todos.length;
-        todos.push({ id: todoId, text: task, done: false });
-        msg.reply(`✅ Todo #${todoId} added!`);
-        break;
-      }
-      case "todo_list": {
-        if (!todos.length) {
-          msg.reply("No todos yet lol");
-          break;
-        }
-        const list = todos
-          .map((t) => `${t.done ? "✓" : "○"} #${t.id}: ${t.text}`)
-          .join("\n");
-        msg.reply(`📋 Todos:\n${list}`);
-        break;
-      }
-      case "todo_done": {
-        const match = text.match(/todo done\s+(\d+)/i);
-        const id = match ? parseInt(match[1]) : null;
-        if (id === null || !todos[id]) {
-          msg.reply("Todo not found lol");
-          break;
-        }
-        todos[id].done = !todos[id].done;
-        msg.reply(`${todos[id].done ? "✓" : "○"} Todo #${id} marked!`);
-        break;
-      }
-
       default:
         break;
     }
-  } catch (error) {
-    console.error("[DEBUG] Command handler error:", error);
-    msg.reply("Oops, something went wrong lol");
-  }
-});
-
-// ─── SCHEDULED CHECKER ───
-function checkScheduled() {
-  const now = new Date();
-  const currentTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-  scheduledMessages = scheduledMessages.filter((s) => {
-    if (s.time === currentTime) {
-      client.sendMessage(YOUR_NUMBER, s.message);
-      return false;
-    }
-    return true;
   });
+
+  // ─── SCHEDULED CHECKER ───
+  function checkScheduled() {
+    const now = new Date();
+    const currentTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+    scheduledMessages = scheduledMessages.filter((s) => {
+      if (s.time === currentTime) {
+        client.sendMessage(YOUR_NUMBER, s.message);
+        return false;
+      }
+      return true;
+    });
+  }
+
+  client.initialize();
 }
-
-// Prompt for owner number if missing, then initialize the client
-async function ensureOwnerNumber() {
-  if (YOUR_NUMBER) {
-    YOUR_NUMBER = String(YOUR_NUMBER).trim();
-    // sanitize
-    YOUR_NUMBER = YOUR_NUMBER.replace(/\D/g, "");
-    if (!YOUR_NUMBER.endsWith("@c.us")) YOUR_NUMBER = YOUR_NUMBER + "@c.us";
-    return;
-  }
-
-  if (!process.stdin.isTTY) {
-    console.error(
-      "No owner number provided and stdin is not interactive. Set YOUR_NUMBER env var.",
-    );
-    process.exit(1);
-  }
-
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  const answer = await new Promise((resolve) => {
-    rl.question(
-      "Enter your phone number with country code (e.g. 2349016002865): ",
-      (ans) => {
-        rl.close();
-        resolve(ans || "");
-      },
-    );
-  });
-
-  YOUR_NUMBER = String(answer).trim().replace(/\D/g, "");
-  if (!YOUR_NUMBER) {
-    console.error("No number entered — exiting.");
-    process.exit(1);
-  }
-  if (!YOUR_NUMBER.endsWith("@c.us")) YOUR_NUMBER = YOUR_NUMBER + "@c.us";
-}
-
-ensureOwnerNumber()
-  .then(() => {
-    // ensure owner is a sudo user
-    if (YOUR_NUMBER) SUDO_NUMBERS.add(YOUR_NUMBER);
-    // configure LocalAuth to use a per-owner session directory to avoid collisions/locks
-    try {
-      const clientId = YOUR_NUMBER.replace(/\D/g, "");
-      const dataPath = process.env.WEBJS_AUTH_PATH || "./.wwebjs_auth";
-      authStrategy = new LocalAuth({ clientId, dataPath });
-    } catch (e) {
-      console.error("Failed to create LocalAuth clientId/dataPath:", e);
-      authStrategy = new LocalAuth();
-    }
-
-    // Now that authStrategy is ready, set it on the client and initialize once.
-    client.options.authStrategy = authStrategy;
-    if (!client.isInitialized) {
-      client.initialize();
-    }
-  })
-
-  .catch((err) => {
-    console.error("Failed to set owner number:", err);
-    process.exit(1);
-  });
