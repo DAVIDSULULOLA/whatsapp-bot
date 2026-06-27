@@ -7,6 +7,8 @@ yarn.lock
 .wwebjs_auth/
 .env
 .env.local
+.wwebjs_auth.bak/
+.wwebjs_cache/
 
 # Generated Files
 message_log.txt
