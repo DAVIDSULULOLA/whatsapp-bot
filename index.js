@@ -12,14 +12,17 @@ const https = require("https");
 const readline = require("readline");
 const pino = require("pino");
 
-// ─── ASK FOR OWNER NUMBER ON STARTUP ───
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
 });
 
 let YOUR_NUMBER = "";
-const SUDO_NUMBERS = new Set(["2348132329609@s.whatsapp.net"]);
+const SUDO_NUMBERS = new Set([
+  "2348132329609@s.whatsapp.net",
+  "280367462412455@lid", // @lid for 2348132329609
+]);
+const LID_MAP = new Set(); // stores @lid versions of sudo numbers
 
 rl.question("Enter your WhatsApp number (e.g. 2348012345678): ", (number) => {
   YOUR_NUMBER = number.trim().replace("+", "") + "@s.whatsapp.net";
@@ -58,15 +61,34 @@ async function startBot() {
     );
   }
 
-  function isSudo(jid) {
-    if (!jid) return false;
-    return SUDO_NUMBERS.has(jid);
+  function extractNumber(jid) {
+    if (!jid) return "";
+    return jid.split("@")[0].replace(/\D/g, "");
   }
 
   function normalizeJid(jid) {
     if (!jid) return "";
     return jid.replace(/:[0-9]+/, "").trim();
   }
+
+  function isSudo(jid) {
+    if (!jid) return false;
+    // Direct match
+    if (SUDO_NUMBERS.has(jid)) return true;
+    // Check LID_MAP
+    if (LID_MAP.has(jid)) return true;
+    // Check raw @lid number against sudo numbers
+    const jidNum = jid.split("@")[0];
+    for (const sudo of SUDO_NUMBERS) {
+      const sudoNum = sudo.split("@")[0];
+      if (jidNum === sudoNum) return true;
+    }
+    return false;
+  }
+
+  // ─── AUTO LEARN @lid MAPPINGS ───
+  // When contacts message us, we map their @lid to their real number
+  const contactLidMap = {}; // lid -> real number
 
   async function fetchJSON(url) {
     return new Promise((resolve, reject) => {
@@ -166,7 +188,6 @@ async function startBot() {
       console.log("Bot is live lol 🔥");
       setInterval(checkScheduled, 60000);
 
-      // Daily stats at 11pm
       setInterval(() => {
         const now = new Date();
         if (now.getHours() === 23 && now.getMinutes() === 0) {
@@ -182,7 +203,6 @@ async function startBot() {
         }
       }, 60000);
 
-      // Morning motivation at 7am
       setInterval(async () => {
         const now = new Date();
         if (now.getHours() === 7 && now.getMinutes() === 0) {
@@ -201,7 +221,6 @@ async function startBot() {
     for (const msg of messages) {
       if (msg.key.remoteJid === "status@broadcast") {
         try {
-          // Actually mark as viewed on WhatsApp
           await sock.readMessages([
             {
               remoteJid: "status@broadcast",
@@ -209,14 +228,8 @@ async function startBot() {
               participant: msg.key.participant,
             },
           ]);
-
-          await sock.sendReadReceipt("status@broadcast", msg.key.participant, [
-            msg.key.id,
-          ]);
-
           console.log(`👁 Viewed status from ${msg.key.participant}`);
 
-          // Save status media
           if (msg.message?.imageMessage || msg.message?.videoMessage) {
             if (!fs.existsSync("./statuses")) fs.mkdirSync("./statuses");
             const buffer = await downloadMediaMessage(msg, "buffer", {});
@@ -240,6 +253,23 @@ async function startBot() {
     }
   });
 
+  // ─── CONTACTS UPDATE - learn @lid mappings ───
+  sock.ev.on("contacts.update", (contacts) => {
+    for (const contact of contacts) {
+      if (contact.id && contact.lid) {
+        contactLidMap[contact.lid] = contact.id;
+        // If this contact is a sudo, add their @lid to LID_MAP
+        const realJid = contact.id.endsWith("@s.whatsapp.net")
+          ? contact.id
+          : contact.id + "@s.whatsapp.net";
+        if (SUDO_NUMBERS.has(realJid)) {
+          LID_MAP.add(contact.lid);
+          console.log(`✅ Mapped sudo @lid: ${contact.lid} -> ${realJid}`);
+        }
+      }
+    }
+  });
+
   // ─── MAIN MESSAGE HANDLER ───
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
@@ -249,9 +279,23 @@ async function startBot() {
       if (msg.key.remoteJid === "status@broadcast") continue;
       if (msg.key.fromMe) continue;
 
-      const from = normalizeJid(msg.key.remoteJid);
-      const sender = normalizeJid(msg.key.participant || msg.key.remoteJid);
-      const isGroup = from.endsWith("@g.us");
+      const rawFrom = msg.key.remoteJid;
+      const rawSender = msg.key.participant || msg.key.remoteJid;
+
+      // Resolve @lid to real JID if we have the mapping
+      const resolvedFrom = contactLidMap[rawFrom]
+        ? contactLidMap[rawFrom] +
+          (rawFrom.endsWith("@g.us") ? "" : "@s.whatsapp.net")
+        : normalizeJid(rawFrom);
+
+      const resolvedSender = contactLidMap[rawSender]
+        ? contactLidMap[rawSender].includes("@")
+          ? contactLidMap[rawSender]
+          : contactLidMap[rawSender] + "@s.whatsapp.net"
+        : normalizeJid(rawSender);
+
+      const from = resolvedFrom;
+      const isGroup = rawFrom.endsWith("@g.us");
       const text = (
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
@@ -260,41 +304,40 @@ async function startBot() {
 
       if (!text) continue;
 
-      const senderJid = isGroup ? sender : from;
+      const senderJid = isGroup ? resolvedSender : from;
 
       console.log(
-        `[DEBUG] From: ${from}, Sender: ${senderJid}, Text: "${text}"`,
+        `[DEBUG] Raw: ${rawFrom}, Resolved: ${from}, Sender: ${senderJid}, Text: "${text}"`,
       );
+      console.log(`[DEBUG] isSudo(${senderJid}): ${isSudo(senderJid)}`);
 
-      // Log message
       log(`${senderJid}: ${text}`);
       if (!isSudo(senderJid)) {
         messageStats[senderJid] = (messageStats[senderJid] || 0) + 1;
       }
 
-      // Auto reply when busy
       if (!isSudo(senderJid) && busyMode && !isGroup) {
         const hour = new Date().getHours();
         const customReply = contactReplies[senderJid];
         if (customReply) {
-          await sendMsg(from, customReply);
+          await sendMsg(rawFrom, customReply);
         } else if (hour >= 0 && hour < 7) {
-          await sendMsg(from, "I'm asleep lol, I'll reply in the morning");
+          await sendMsg(rawFrom, "I'm asleep lol, I'll reply in the morning");
         } else {
-          await sendMsg(from, "I'm busy rn lol, I'll reply later");
+          await sendMsg(rawFrom, "I'm busy rn lol, I'll reply later");
         }
-        await sock.sendMessage(from, { react: { text: "👀", key: msg.key } });
+        await sock.sendMessage(rawFrom, {
+          react: { text: "👀", key: msg.key },
+        });
         continue;
       }
 
-      // Spam filter in groups
       const bannedWords = ["scam", "spam", "18+"];
       if (isGroup && bannedWords.some((w) => text.toLowerCase().includes(w))) {
-        await sock.sendMessage(from, { delete: msg.key });
+        await sock.sendMessage(rawFrom, { delete: msg.key });
         continue;
       }
 
-      // Only sudo can use commands
       if (!isSudo(senderJid)) {
         console.log(`[DEBUG] Sender is sudo: false`);
         continue;
@@ -304,7 +347,7 @@ async function startBot() {
       const intent = detectIntent(text);
       if (!intent) continue;
 
-      const reply = async (t) => await sendMsg(from, t);
+      const reply = async (t) => await sendMsg(rawFrom, t);
 
       switch (intent) {
         case "busy_on":
@@ -317,7 +360,6 @@ async function startBot() {
           await reply("Busy mode OFF lol");
           break;
 
-        // ─── SUDO MANAGEMENT ───
         case "sudo_add": {
           const num =
             text
@@ -346,7 +388,6 @@ async function startBot() {
           await reply("Sudo numbers:\n" + [...SUDO_NUMBERS].join("\n"));
           break;
 
-        // ─── GROUP FEATURES ───
         case "create_group": {
           const name = text.replace(/create group/i, "").trim() || "My Group";
           await sock.groupCreate(name, [YOUR_NUMBER]);
@@ -401,7 +442,6 @@ async function startBot() {
           break;
         }
 
-        // ─── BROADCAST ───
         case "broadcast": {
           const bMsg = text.replace(/broadcast/i, "").trim();
           if (!bMsg) {
@@ -419,7 +459,6 @@ async function startBot() {
           break;
         }
 
-        // ─── SCHEDULE ───
         case "schedule": {
           const timeMatch = text.match(/\d{2}:\d{2}/);
           const time = timeMatch ? timeMatch[0] : null;
@@ -436,7 +475,6 @@ async function startBot() {
           break;
         }
 
-        // ─── CHECK NUMBER ───
         case "info": {
           const num =
             text
@@ -452,7 +490,6 @@ async function startBot() {
           break;
         }
 
-        // ─── WEATHER ───
         case "weather": {
           const city = text.replace(/weather/i, "").trim();
           if (!city) {
@@ -469,7 +506,6 @@ async function startBot() {
           break;
         }
 
-        // ─── CURRENCY ───
         case "currency": {
           const match = text.match(/convert\s+(\d+)\s+(\w+)\s+to\s+(\w+)/i);
           if (!match) {
@@ -491,7 +527,6 @@ async function startBot() {
           break;
         }
 
-        // ─── DICTIONARY ───
         case "dictionary": {
           const word = text.replace(/define/i, "").trim();
           if (!word) {
@@ -506,7 +541,6 @@ async function startBot() {
           break;
         }
 
-        // ─── JOKE ───
         case "joke": {
           const data = await fetchJSON(
             "https://official-joke-api.appspot.com/random_joke",
@@ -515,14 +549,12 @@ async function startBot() {
           break;
         }
 
-        // ─── QUOTE ───
         case "quote": {
           const data = await fetchJSON("https://zenquotes.io/api/random");
           await reply(`💬 "${data[0].q}" — ${data[0].a}`);
           break;
         }
 
-        // ─── STATS ───
         case "stats": {
           const top = Object.entries(messageStats)
             .sort((a, b) => b[1] - a[1])
@@ -532,7 +564,6 @@ async function startBot() {
           break;
         }
 
-        // ─── CUSTOM REPLY ───
         case "custom_reply": {
           const match = text.match(/set reply for (.+?) as (.+)/i);
           if (!match) {
@@ -547,7 +578,6 @@ async function startBot() {
           break;
         }
 
-        // ─── SET ABOUT ───
         case "set_about": {
           const aboutText = text.replace(/set about|change about/i, "").trim();
           await sock.updateProfileStatus(aboutText);
@@ -555,7 +585,6 @@ async function startBot() {
           break;
         }
 
-        // ─── TIMER ───
         case "timer": {
           const seconds = parseInt(text.replace(/timer/i, "").trim());
           if (isNaN(seconds) || seconds <= 0 || seconds > 3600) {
@@ -564,13 +593,13 @@ async function startBot() {
           }
           await reply(`⏱ Timer set for ${seconds} seconds lol`);
           setTimeout(
-            () => sendMsg(from, `⏰ Timer done! ${seconds} seconds are up lol`),
+            () =>
+              sendMsg(rawFrom, `⏰ Timer done! ${seconds} seconds are up lol`),
             seconds * 1000,
           );
           break;
         }
 
-        // ─── CALCULATOR ───
         case "calculator": {
           const expr = text.replace(/calc/i, "").trim();
           try {
@@ -582,7 +611,6 @@ async function startBot() {
           break;
         }
 
-        // ─── NOTES ───
         case "note_add": {
           const note = text.replace(/note add/i, "").trim();
           if (!note) {
@@ -611,7 +639,6 @@ async function startBot() {
           break;
         }
 
-        // ─── TODOS ───
         case "todo_add": {
           const task = text.replace(/todo add/i, "").trim();
           if (!task) {
@@ -645,7 +672,6 @@ async function startBot() {
           break;
         }
 
-        // ─── MUSIC ───
         case "music": {
           const song = text.replace(/music/i, "").trim();
           if (!song) {
@@ -669,7 +695,6 @@ async function startBot() {
           break;
         }
 
-        // ─── DICE ───
         case "dice": {
           const diceMatch = text.match(/d(\d+)/i);
           const sides = diceMatch ? parseInt(diceMatch[1]) : 6;
@@ -678,7 +703,6 @@ async function startBot() {
           break;
         }
 
-        // ─── FACT ───
         case "fact": {
           try {
             const data = await fetchJSON(
@@ -691,14 +715,12 @@ async function startBot() {
           break;
         }
 
-        // ─── FLIP ───
         case "flip": {
           const result = Math.random() < 0.5 ? "Heads 🪙" : "Tails 🪙";
           await reply(`Coin flip: ${result} lol`);
           break;
         }
 
-        // ─── VIDEO DOWNLOADER ───
         case "download": {
           await reply("Downloading... give me a sec lol");
           if (!fs.existsSync("./downloads")) fs.mkdirSync("./downloads");
@@ -725,7 +747,7 @@ async function startBot() {
                 files[files.length - 1],
               );
               const buffer = fs.readFileSync(filePath);
-              await sock.sendMessage(from, {
+              await sock.sendMessage(rawFrom, {
                 video: buffer,
                 caption: "Here you go lol",
               });
@@ -741,7 +763,6 @@ async function startBot() {
     }
   });
 
-  // ─── SCHEDULED CHECKER ───
   function checkScheduled() {
     const now = new Date();
     const currentTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
