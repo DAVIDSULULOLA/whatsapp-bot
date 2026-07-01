@@ -5,8 +5,22 @@ yarn.lock
 
 # Environment & Session
 .wwebjs_auth/
+.wwebjs_cache/
+auth_info/
 .env
 .env.local
+
+# Baileys auth/session
+auth_info/
+session/
+*.json
+
+# Except these project files
+!package.json
+!package-lock.json
+!tsconfig.json
+!jsconfig.json
+!README.md
 
 # Generated Files
 message_log.txt
